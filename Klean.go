@@ -37,6 +37,8 @@ var metadataFieldsToRemove = []string{
 	"ownerReferences",
 	"finalizers",
 	"generateName",
+	"labels",    // Add optional label cleanup
+	"namespace", // Will be handled separately
 }
 
 // Additional runtime fields to remove
@@ -51,6 +53,11 @@ var runtimeFieldsToRemove = []string{
 	"metadata.deletionTimestamp",
 	"metadata.deletionGracePeriodSeconds",
 	"metadata.managedFields",
+	"metadata.labels",
+	"metadata.annotations.kubectl.kubernetes.io/last-applied-configuration",
+	"status.conditions",
+	"status.observedGeneration",
+	"status.loadBalancer",
 }
 
 // Annotations to remove
@@ -119,15 +126,30 @@ func cleanAnnotations(annotations map[string]interface{}) {
 
 // cleanMetadata removes unwanted fields from the metadata section
 func cleanMetadata(metadata map[string]interface{}) {
-	for _, field := range metadataFieldsToRemove {
-		delete(metadata, field)
-	}
-
-	// Clean annotations
+	// First clean annotations
 	if annotations, ok := metadata["annotations"].(map[string]interface{}); ok {
 		cleanAnnotations(annotations)
 		if len(annotations) == 0 {
 			delete(metadata, "annotations")
+		}
+	}
+
+	// Remove all unwanted fields
+	for _, field := range metadataFieldsToRemove {
+		delete(metadata, field)
+	}
+
+	// Clean labels if they match certain patterns
+	if labels, ok := metadata["labels"].(map[string]interface{}); ok {
+		for k := range labels {
+			if strings.HasPrefix(k, "kubernetes.io/") ||
+				strings.HasPrefix(k, "k8s.io/") ||
+				strings.HasPrefix(k, "control-plane.alpha.kubernetes.io/") {
+				delete(labels, k)
+			}
+		}
+		if len(labels) == 0 {
+			delete(metadata, "labels")
 		}
 	}
 
@@ -139,29 +161,76 @@ func cleanMetadata(metadata map[string]interface{}) {
 
 // cleanSpec removes unwanted fields from the spec section
 func cleanSpec(spec map[string]interface{}) {
-	for _, field := range specFieldsToRemove {
-		delete(spec, field)
+	// Remove specific fields
+	fieldsToRemove := append(specFieldsToRemove,
+		"progressDeadlineSeconds",
+		"revisionHistoryLimit",
+		"strategy",
+		"template.spec.imagePullPolicy",
+		"template.spec.terminationMessagePath",
+		"template.spec.terminationMessagePolicy",
+		"template.spec.dnsPolicy",
+		"template.spec.schedulerName",
+		"template.spec.securityContext",
+		"template.spec.terminationGracePeriodSeconds",
+	)
+
+	for _, field := range fieldsToRemove {
+		parts := strings.Split(field, ".")
+		current := spec
+		for i, part := range parts {
+			if i == len(parts)-1 {
+				delete(current, part)
+				continue
+			}
+			if next, ok := current[part].(map[string]interface{}); ok {
+				current = next
+			} else {
+				break
+			}
+		}
 	}
 
-	// Clean template metadata if present
+	// Clean template metadata and spec
 	if template, ok := spec["template"].(map[string]interface{}); ok {
 		if templateMetadata, ok := template["metadata"].(map[string]interface{}); ok {
 			cleanMetadata(templateMetadata)
+			if len(templateMetadata) == 0 {
+				delete(template, "metadata")
+			}
+		}
+		if templateSpec, ok := template["spec"].(map[string]interface{}); ok {
+			cleanPodTemplateSpec(templateSpec)
+			if len(templateSpec) == 0 {
+				delete(template, "spec")
+			}
 		}
 	}
 }
 
 // cleanDeploymentSpec handles deployment-specific cleanup
 func cleanDeploymentSpec(spec map[string]interface{}) {
-	delete(spec, "replicas")
-	delete(spec, "paused")
-	delete(spec, "progressDeadlineSeconds")
-	delete(spec, "revisionHistoryLimit")
-	delete(spec, "strategy")
+	// Remove deployment-specific fields
+	fieldsToRemove := []string{
+		"replicas",
+		"paused",
+		"progressDeadlineSeconds",
+		"revisionHistoryLimit",
+		"strategy",
+		"selector", // Often auto-generated
+	}
+
+	for _, field := range fieldsToRemove {
+		delete(spec, field)
+	}
 
 	// Clean pod template
 	if template, ok := spec["template"].(map[string]interface{}); ok {
 		cleanPodTemplateSpec(template)
+		// Remove template if empty
+		if len(template) == 0 {
+			delete(spec, "template")
+		}
 	}
 }
 
@@ -197,8 +266,7 @@ func cleanPodTemplateSpec(template map[string]interface{}) {
 
 // cleanContainerSpec cleans container specific fields
 func cleanContainerSpec(container map[string]interface{}) {
-	// Remove runtime specific container fields
-	for _, field := range []string{
+	fieldsToRemove := []string{
 		"terminationMessagePath",
 		"terminationMessagePolicy",
 		"imagePullPolicy",
@@ -206,8 +274,47 @@ func cleanContainerSpec(container map[string]interface{}) {
 		"livenessProbe",
 		"readinessProbe",
 		"startupProbe",
-	} {
+		"resources", // Often has default values
+		"ports",     // Clean if using default values
+	}
+
+	for _, field := range fieldsToRemove {
 		delete(container, field)
+	}
+
+	// Clean port definitions if they're using defaults
+	if ports, ok := container["ports"].([]interface{}); ok {
+		cleanPorts := make([]interface{}, 0)
+		for _, p := range ports {
+			if port, ok := p.(map[string]interface{}); ok {
+				// Remove default protocol
+				if proto, exists := port["protocol"].(string); exists && proto == "TCP" {
+					delete(port, "protocol")
+				}
+				if len(port) > 0 {
+					cleanPorts = append(cleanPorts, port)
+				}
+			}
+		}
+		if len(cleanPorts) > 0 {
+			container["ports"] = cleanPorts
+		} else {
+			delete(container, "ports")
+		}
+	}
+}
+
+// cleanConfigMapData cleans ConfigMap specific data
+func cleanConfigMapData(data map[string]interface{}) {
+	// Keep the data but clean any runtime-specific content
+	for key, value := range data {
+		if strVal, ok := value.(string); ok {
+			// Clean any runtime configuration from data values
+			if strings.Contains(strVal, "kubectl.kubernetes.io") ||
+				strings.Contains(strVal, "kubernetes.io/") {
+				delete(data, key)
+			}
+		}
 	}
 }
 
@@ -246,6 +353,10 @@ func cleanupMap(m map[string]interface{}) {
 			if spec, ok := m["spec"].(map[string]interface{}); ok {
 				delete(spec, "clusterIP")
 				delete(spec, "clusterIPs")
+			}
+		case "ConfigMap":
+			if data, ok := m["data"].(map[string]interface{}); ok {
+				cleanConfigMapData(data)
 			}
 		}
 	}
@@ -287,7 +398,9 @@ func removeRuntimeFields(m map[string]interface{}) {
 				break
 			}
 		}
-		delete(current, parts[len(parts)-1])
+		if len(parts) > 0 {
+			delete(current, parts[len(parts)-1])
+		}
 	}
 }
 
@@ -295,16 +408,12 @@ func removeRuntimeFields(m map[string]interface{}) {
 func cleanKubernetesObject(objMap map[string]interface{}) {
 	// Remove namespace-specific fields
 	if metadata, ok := objMap["metadata"].(map[string]interface{}); ok {
-		if _, exists := metadata["namespace"]; exists {
-			metadata["namespace"] = "default" // Replace with a generic namespace
-		}
+		delete(metadata, "namespace")
 	}
 
 	// Remove controller-specific fields
 	if spec, ok := objMap["spec"].(map[string]interface{}); ok {
-		if _, exists := spec["replicas"]; exists {
-			delete(spec, "replicas") // Example: Remove replicas field
-		}
+		delete(spec, "replicas")
 	}
 
 	// Validate and clean fields using Kubernetes schema
