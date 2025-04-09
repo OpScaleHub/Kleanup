@@ -72,11 +72,20 @@ jobs:
         with:
           go-version: '1.23'
 
+      - name: Ensure Git Tag
+        run: |
+          if [ -z "$(git tag --points-at HEAD)" ]; then
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git tag -a v$(date +'%Y.%m.%d.%H%M%S') -m "Automated tag"o avoid requiring a tag
+            git push origin --tags
+          fi
+
       - name: Create GitHub Release
         id: release
         uses: goreleaser/goreleaser-action@v4
         with:
           version: latest
-          args: release # Specify the GoReleaser command
+          args: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
