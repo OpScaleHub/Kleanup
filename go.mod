@@ -1,4 +1,4 @@
-module github.com/OpScaleHub/Klean
+module github.com/OpScaleHub/Kleanup
 
 go 1.23.0
 
