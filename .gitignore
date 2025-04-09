@@ -1,0 +1,41 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Vendor directory
+/vendor/
+
+# Go modules
+go.mod
+go.sum
+
+# Build output directory
+bin/
+
+# IDE specific files
+.idea/
+.vscode/
+
+# Temporary files
+*~
+# Compiled Object files
+*.o
+*.hi
+
+# Dependency directories (remove if you vendor your dependencies)
+/Godeps
+/vendor
+
+# Log files
+*.log
+
+# OS generated files
+.DS_Store
+
+# local build artifacts
+Kleanup

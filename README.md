@@ -1,7 +1,7 @@
-# Klean
+# Kleanup
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/OpScaleHub/Klean)](https://golang.org/)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/OpScaleHub/Kleanup)](https://golang.org/)
 
 A lightweight tool to clean Kubernetes YAML manifests by removing runtime-specific fields, making them portable across clusters and namespaces.
 
@@ -17,7 +17,7 @@ A lightweight tool to clean Kubernetes YAML manifests by removing runtime-specif
 ## Installation
 
 ```bash
-go install github.com/OpScaleHub/Klean@latest
+go install github.com/OpScaleHub/Kleanup@latest
 ```
 
 ## Usage
