@@ -1,8 +1,6 @@
 module github.com/OpScaleHub/Kleanup
 
-go 1.23.0
-
-toolchain go1.23.8
+go 1.23
 
 require gopkg.in/yaml.v2 v2.4.0
 
