@@ -1,6 +1,3 @@
-// Copyright (c) 2024 OpScaleHub
-// SPDX-License-Identifier: MIT
-
 package main
 
 import (
@@ -10,106 +7,124 @@ import (
 	"os"
 	"strings"
 
+	"log"
+
 	"gopkg.in/yaml.v2"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/kubernetes/scheme"
 )
 
-// Struct to represent any Kubernetes object (only metadata for simplicity)
+// KubernetesObject represents the basic structure of Kubernetes objects.
 type KubernetesObject struct {
 	APIVersion string                 `yaml:"apiVersion"`
 	Kind       string                 `yaml:"kind"`
-	Metadata   map[string]interface{} `yaml:"metadata"`
+	Metadata   map[string]interface{} `yaml:"metadata,omitempty"`
 	Spec       map[string]interface{} `yaml:"spec,omitempty"`
 	Status     map[string]interface{} `yaml:"status,omitempty"`
-	Data       map[string]interface{} `yaml:"data,omitempty"`
-	Type       string                 `yaml:"type,omitempty"`
+	Data       map[string]interface{} `yaml:"data,omitempty"` // For ConfigMaps
+	Type       string                 `yaml:"type,omitempty"` // e.g., for Secrets
 }
 
-// Fields to remove from metadata
-var metadataFieldsToRemove = []string{
-	"creationTimestamp",
-	"generation",
-	"resourceVersion",
-	"selfLink",
-	"uid",
-	"managedFields",
-	"ownerReferences",
-	"finalizers",
-	"generateName",
-	"labels",    // Add optional label cleanup
-	"namespace", // Will be handled separately
+// CleanupOptions defines options to customize the cleanup process.
+type CleanupOptions struct {
+	RemoveManagedFields bool
+	RemoveStatus        bool
+	RemoveNamespace     bool
+	RemoveClusterName   bool     // Remove cluster name
+	RemoveLabels        []string // labels to remove
+	RemoveAnnotations   []string // annotations to remove
+	RemoveEmpty         bool     // Remove empty fields
+	CleanupFinalizers   bool     // Remove finalizers
+	RevertToDeployment  bool     // Attempt to reconstruct Deployment
 }
 
-// Additional runtime fields to remove
-var runtimeFieldsToRemove = []string{
-	"status",
-	"template.generation",
-	"metadata.generation",
-	"metadata.resourceVersion",
-	"metadata.selfLink",
-	"metadata.uid",
-	"metadata.creationTimestamp",
-	"metadata.deletionTimestamp",
-	"metadata.deletionGracePeriodSeconds",
-	"metadata.managedFields",
-	"metadata.labels",
-	"metadata.annotations.kubectl.kubernetes.io/last-applied-configuration",
-	"status.conditions",
-	"status.observedGeneration",
-	"status.loadBalancer",
+// MetadataCleaner defines an interface for cleaning object metadata.
+type MetadataCleaner interface {
+	Clean(metadata map[string]interface{}, options *CleanupOptions)
 }
 
-// Annotations to remove
-var annotationPrefixesToRemove = []string{
-	"kubectl.kubernetes.io/",
-	"deployment.kubernetes.io/",
-	"kubernetes.io/",
-	"k8s.io/",
-	"control-plane.alpha.kubernetes.io/",
-	"app.kubernetes.io/",
-	"autoscaling.alpha.kubernetes.io/",
-	"batch.kubernetes.io/",
-	"helm.sh/",
-	"meta.helm.sh/",
+// ObjectCleaner defines an interface for cleaning Kubernetes objects.
+type ObjectCleaner interface {
+	Clean(obj *KubernetesObject, options *CleanupOptions)
 }
 
-// Fields to remove from spec
-var specFieldsToRemove = []string{
-	"progressDeadlineSeconds",
-	"revisionHistoryLimit",
-	"terminationMessagePath",
-	"terminationMessagePolicy",
-	"dnsPolicy",
-	"schedulerName",
-	"securityContext",
-	"terminationGracePeriodSeconds",
-	"serviceAccount",
-	"nodeName",
-	"hostname",
-	"subdomain",
-	"clusterIP",
-	"clusterIPs",
-	"volumeName",
-	"volumeClaimTemplate",
-	"serviceAccountName",
-	"automountServiceAccountToken",
-	"nodeSelector",
-	"tolerations",
-	"hostNetwork",
-	"hostPID",
-	"hostIPC",
+// GenericMetadataCleaner cleans common metadata fields.
+type GenericMetadataCleaner struct{}
+
+func (c *GenericMetadataCleaner) Clean(metadata map[string]interface{}, options *CleanupOptions) {
+	fieldsToRemove := []string{
+		"creationTimestamp",
+		"generation",
+		"resourceVersion",
+		"selfLink",
+		"uid",
+		"ownerReferences",
+		"managedFields",
+	}
+	if !options.RemoveManagedFields {
+		fieldsToRemove = []string{
+			"creationTimestamp",
+			"generation",
+			"resourceVersion",
+			"selfLink",
+			"uid",
+			"ownerReferences",
+		}
+	}
+	if !options.CleanupFinalizers {
+		fieldsToRemove = append(fieldsToRemove, "finalizers")
+	}
+
+	for _, field := range fieldsToRemove {
+		delete(metadata, field)
+	}
+
+	// Clean annotations
+	if annotations, ok := metadata["annotations"].(map[string]interface{}); ok {
+		cleanAnnotations(annotations, options.RemoveAnnotations)
+	}
+	if labels, ok := metadata["labels"].(map[string]interface{}); ok {
+		cleanLabels(labels, options.RemoveLabels)
+	}
+
+	if options.RemoveNamespace {
+		delete(metadata, "namespace")
+	}
+	if len(metadata) == 0 && options.RemoveEmpty {
+		delete(metadata, "metadata")
+	}
 }
 
-// Custom error types
-type EmptyDocumentError struct{}
-
-func (e *EmptyDocumentError) Error() string {
-	return "empty YAML document"
+func cleanLabels(labels map[string]interface{}, removeLabels []string) {
+	if len(removeLabels) == 0 {
+		return
+	}
+	for key := range labels {
+		for _, labelToRemove := range removeLabels {
+			if key == labelToRemove {
+				delete(labels, key)
+				break
+			}
+		}
+	}
 }
 
-// cleanAnnotations removes annotations matching specific prefixes
-func cleanAnnotations(annotations map[string]interface{}) {
+// cleanAnnotations removes annotations matching specific prefixes and user provided annotations
+func cleanAnnotations(annotations map[string]interface{}, removeAnnotations []string) {
+	annotationPrefixesToRemove := []string{
+		"kubectl.kubernetes.io/",
+		"deployment.kubernetes.io/",
+		"apps.kubernetes.io/",
+		"pod-template-hash",
+		"statefulset.kubernetes.io/",
+		"controller-revision-hash",
+		"service.kubernetes.io/",
+		"batch.kubernetes.io/",
+		"networking.k8s.io/",
+		"rbac.authorization.k8s.io/",
+		"argocd.argoproj.io/",
+		"helm.sh/",
+		"meta.helm.sh/",
+	}
+
 	for key := range annotations {
 		shouldDelete := false
 		for _, prefix := range annotationPrefixesToRemove {
@@ -118,154 +133,237 @@ func cleanAnnotations(annotations map[string]interface{}) {
 				break
 			}
 		}
+		if !shouldDelete { // check user provided annotations to remove
+			for _, annotationToRemove := range removeAnnotations {
+				if key == annotationToRemove {
+					shouldDelete = true
+					break
+				}
+			}
+		}
+
 		if shouldDelete {
 			delete(annotations, key)
 		}
 	}
 }
 
-// cleanMetadata removes unwanted fields from the metadata section
-func cleanMetadata(metadata map[string]interface{}) {
-	// First clean annotations
-	if annotations, ok := metadata["annotations"].(map[string]interface{}); ok {
-		cleanAnnotations(annotations)
-		if len(annotations) == 0 {
-			delete(metadata, "annotations")
-		}
-	}
+// GenericObjectCleaner cleans common object fields.
+type GenericObjectCleaner struct {
+	metadataCleaner MetadataCleaner
+}
 
-	// Remove all unwanted fields
-	for _, field := range metadataFieldsToRemove {
-		delete(metadata, field)
+func (c *GenericObjectCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	if obj.Metadata != nil {
+		c.metadataCleaner.Clean(obj.Metadata, options)
 	}
-
-	// Clean labels if they match certain patterns
-	if labels, ok := metadata["labels"].(map[string]interface{}); ok {
-		for k := range labels {
-			if strings.HasPrefix(k, "kubernetes.io/") ||
-				strings.HasPrefix(k, "k8s.io/") ||
-				strings.HasPrefix(k, "control-plane.alpha.kubernetes.io/") {
-				delete(labels, k)
-			}
-		}
-		if len(labels) == 0 {
-			delete(metadata, "labels")
-		}
+	if options.RemoveStatus {
+		obj.Status = nil
 	}
-
-	// Remove metadata if empty
-	if len(metadata) == 0 {
-		delete(metadata, "metadata")
+	if options.RemoveClusterName {
+		//delete cluster name
+	}
+	if options.RemoveEmpty {
+		removeEmptyFields(obj)
 	}
 }
 
-// cleanSpec removes unwanted fields from the spec section
-func cleanSpec(spec map[string]interface{}) {
-	// Remove specific fields
-	fieldsToRemove := append(specFieldsToRemove,
-		"progressDeadlineSeconds",
-		"revisionHistoryLimit",
-		"strategy",
-		"template.spec.imagePullPolicy",
-		"template.spec.terminationMessagePath",
-		"template.spec.terminationMessagePolicy",
-		"template.spec.dnsPolicy",
-		"template.spec.schedulerName",
-		"template.spec.securityContext",
-		"template.spec.terminationGracePeriodSeconds",
-	)
-
-	for _, field := range fieldsToRemove {
-		parts := strings.Split(field, ".")
-		current := spec
-		for i, part := range parts {
-			if i == len(parts)-1 {
-				delete(current, part)
-				continue
-			}
-			if next, ok := current[part].(map[string]interface{}); ok {
-				current = next
-			} else {
-				break
-			}
+func removeEmptyFields(obj *KubernetesObject) {
+	if obj.Metadata != nil {
+		if len(obj.Metadata) == 0 {
+			obj.Metadata = nil
 		}
 	}
-
-	// Clean template metadata and spec
-	if template, ok := spec["template"].(map[string]interface{}); ok {
-		if templateMetadata, ok := template["metadata"].(map[string]interface{}); ok {
-			cleanMetadata(templateMetadata)
-			if len(templateMetadata) == 0 {
-				delete(template, "metadata")
-			}
+	if obj.Spec != nil {
+		if len(obj.Spec) == 0 {
+			obj.Spec = nil
 		}
-		if templateSpec, ok := template["spec"].(map[string]interface{}); ok {
-			cleanPodTemplateSpec(templateSpec)
-			if len(templateSpec) == 0 {
-				delete(template, "spec")
+	}
+	if obj.Status != nil {
+		if len(obj.Status) == 0 {
+			obj.Status = nil
+		}
+	}
+	if obj.Data != nil {
+		if len(obj.Data) == 0 {
+			obj.Data = nil
+		}
+	}
+}
+
+// DeploymentCleaner cleans Deployment-specific fields.
+type DeploymentCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *DeploymentCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options) // Clean generic fields
+
+	if obj.Spec != nil {
+		delete(obj.Spec, "replicas")
+		delete(obj.Spec, "revisionHistoryLimit")
+		delete(obj.Spec, "strategy")
+		delete(obj.Spec, "progressDeadlineSeconds")
+
+		if template, ok := obj.Spec["template"].(map[string]interface{}); ok {
+			if spec, ok := template["spec"].(map[string]interface{}); ok {
+				cleanPodSpec(spec, options)
 			}
 		}
 	}
 }
 
-// cleanDeploymentSpec handles deployment-specific cleanup
-func cleanDeploymentSpec(spec map[string]interface{}) {
-	// Remove deployment-specific fields
+// ServiceCleaner cleans Service-specific fields.
+type ServiceCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *ServiceCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+
+	if obj.Spec != nil {
+		delete(obj.Spec, "clusterIP")
+		delete(obj.Spec, "clusterIPs")
+		delete(obj.Spec, "selector")
+	}
+}
+
+// StatefulSetCleaner cleans StatefulSet-specific fields.
+type StatefulSetCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *StatefulSetCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+
+	if obj.Spec != nil {
+		delete(obj.Spec, "replicas")
+		delete(obj.Spec, "revisionHistoryLimit")
+		delete(obj.Spec, "updateStrategy")
+		if template, ok := obj.Spec["template"].(map[string]interface{}); ok {
+			if spec, ok := template["spec"].(map[string]interface{}); ok {
+				cleanPodSpec(spec, options)
+			}
+		}
+	}
+}
+
+// DaemonSetCleaner cleans DaemonSet-specific fields.
+type DaemonSetCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *DaemonSetCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+	if obj.Spec != nil {
+		if template, ok := obj.Spec["template"].(map[string]interface{}); ok {
+			if spec, ok := template["spec"].(map[string]interface{}); ok {
+				cleanPodSpec(spec, options)
+			}
+		}
+	}
+}
+
+// PodCleaner cleans Pod-specific fields.
+type PodCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *PodCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+	if obj.Spec != nil {
+		cleanPodSpec(obj.Spec, options)
+	}
+	if options.RevertToDeployment {
+		revertPodToDeployment(obj)
+	}
+}
+
+// ConfigMapCleaner cleans ConfigMap-specific fields
+type ConfigMapCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *ConfigMapCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+	if obj.Data != nil {
+		cleanConfigMapData(obj.Data)
+	}
+}
+
+// clean config map
+func cleanConfigMapData(data map[string]interface{}) {
+	for key, val := range data {
+		strVal, ok := val.(string)
+		if ok {
+			if strings.Contains(strVal, "kubectl.kubernetes.io/") || strings.Contains(strVal, "kubernetes.io/") {
+				delete(data, key)
+			}
+		}
+	}
+}
+
+// SecretCleaner cleans Secret-specific fields.
+type SecretCleaner struct {
+	genericCleaner *GenericObjectCleaner
+}
+
+func (c *SecretCleaner) Clean(obj *KubernetesObject, options *CleanupOptions) {
+	c.genericCleaner.Clean(obj, options)
+	//clean secret data
+}
+
+// cleanPodSpec removes fields from Pod specs.
+func cleanPodSpec(spec map[string]interface{}, options *CleanupOptions) {
 	fieldsToRemove := []string{
-		"replicas",
-		"paused",
-		"progressDeadlineSeconds",
-		"revisionHistoryLimit",
-		"strategy",
-		"selector", // Often auto-generated
+		"nodeName",
+		"serviceAccountName",
+		"automountServiceAccountToken",
+		"dnsPolicy",
+		"nodeSelector",
+		"tolerations",
+		"schedulerName",
+		"priorityClassName",
+		"enableServiceLinks",
+		"preemptionPolicy",
+		"restartPolicy",
+		"terminationGracePeriodSeconds",
+		"hostIP",                // Remove hostIP
+		"hostPID",               // Remove hostPID
+		"hostname",              // Remove hostname
+		"subdomain",             // Remove subdomain
+		"shareProcessNamespace", //Remove
 	}
-
 	for _, field := range fieldsToRemove {
 		delete(spec, field)
 	}
 
-	// Clean pod template
-	if template, ok := spec["template"].(map[string]interface{}); ok {
-		cleanPodTemplateSpec(template)
-		// Remove template if empty
-		if len(template) == 0 {
-			delete(spec, "template")
-		}
-	}
-}
-
-// cleanPodTemplateSpec cleans pod template specific fields
-func cleanPodTemplateSpec(template map[string]interface{}) {
-	if spec, ok := template["spec"].(map[string]interface{}); ok {
-		// Remove runtime specific pod fields
-		for _, field := range []string{
-			"nodeName",
-			"serviceAccountName",
-			"automountServiceAccountToken",
-			"dnsPolicy",
-			"nodeSelector",
-			"tolerations",
-			"schedulerName",
-			"priorityClassName",
-			"enableServiceLinks",
-			"preemptionPolicy",
-		} {
-			delete(spec, field)
-		}
-
-		// Clean container specs
-		if containers, ok := spec["containers"].([]interface{}); ok {
-			for _, c := range containers {
-				if container, ok := c.(map[string]interface{}); ok {
-					cleanContainerSpec(container)
-				}
+	// Clean containers
+	if containers, ok := spec["containers"].([]interface{}); ok {
+		for _, container := range containers {
+			if containerMap, ok := container.(map[string]interface{}); ok {
+				cleanContainerSpec(containerMap, options) // Clean the container spec
 			}
 		}
 	}
+
+	//clean template metadata
+	if template, ok := spec["template"].(map[string]interface{}); ok {
+		if templateMeta, ok := template["metadata"].(map[string]interface{}); ok {
+			delete(templateMeta, "creationTimestamp")
+			// Clean annotations *within* template.metadata
+			if annotations, ok := templateMeta["annotations"].(map[string]interface{}); ok {
+				cleanAnnotations(annotations, options.RemoveAnnotations)
+			}
+		}
+	}
+
+	// Clean volumes and volumeMounts
+	cleanPodVolumes(spec)
 }
 
-// cleanContainerSpec cleans container specific fields
-func cleanContainerSpec(container map[string]interface{}) {
+// cleanContainerSpec removes fields from container specs.
+func cleanContainerSpec(container map[string]interface{}, options *CleanupOptions) {
 	fieldsToRemove := []string{
 		"terminationMessagePath",
 		"terminationMessagePolicy",
@@ -274,179 +372,195 @@ func cleanContainerSpec(container map[string]interface{}) {
 		"livenessProbe",
 		"readinessProbe",
 		"startupProbe",
-		"resources", // Often has default values
-		"ports",     // Clean if using default values
+		"resources",
+		"tty",       //remove
+		"stdin",     //remove
+		"stdinOnce", //remove
 	}
-
 	for _, field := range fieldsToRemove {
 		delete(container, field)
 	}
 
-	// Clean port definitions if they're using defaults
+	// Clean default ports and recursively clean
 	if ports, ok := container["ports"].([]interface{}); ok {
-		cleanPorts := make([]interface{}, 0)
+		cleanedPorts := make([]interface{}, 0)
 		for _, p := range ports {
 			if port, ok := p.(map[string]interface{}); ok {
-				// Remove default protocol
 				if proto, exists := port["protocol"].(string); exists && proto == "TCP" {
 					delete(port, "protocol")
 				}
 				if len(port) > 0 {
-					cleanPorts = append(cleanPorts, port)
+					cleanedPorts = append(cleanedPorts, port)
 				}
 			}
 		}
-		if len(cleanPorts) > 0 {
-			container["ports"] = cleanPorts
+		if len(cleanedPorts) > 0 {
+			container["ports"] = cleanedPorts
 		} else {
 			delete(container, "ports")
 		}
 	}
-}
 
-// cleanConfigMapData cleans ConfigMap specific data
-func cleanConfigMapData(data map[string]interface{}) {
-	// Keep the data but clean any runtime-specific content
-	for key, value := range data {
-		if strVal, ok := value.(string); ok {
-			// Clean any runtime configuration from data values
-			if strings.Contains(strVal, "kubectl.kubernetes.io") ||
-				strings.Contains(strVal, "kubernetes.io/") {
-				delete(data, key)
-			}
-		}
-	}
-}
-
-// Recursive cleanup function
-func cleanupMap(m map[string]interface{}) {
-	// Skip data cleanup for Secret objects
-	isSecret := false
-	if kind, ok := m["kind"].(string); ok && kind == "Secret" {
-		isSecret = true
-	}
-
-	// Clean metadata
-	if metadata, ok := m["metadata"].(map[string]interface{}); ok {
-		cleanMetadata(metadata)
-	}
-
-	// Clean spec if not a Secret
-	if !isSecret {
-		if spec, ok := m["spec"].(map[string]interface{}); ok {
-			cleanSpec(spec)
-		}
-	}
-
-	// Apply resource-specific cleanup
-	if kind, ok := m["kind"].(string); ok {
-		switch kind {
-		case "Deployment":
-			if spec, ok := m["spec"].(map[string]interface{}); ok {
-				cleanDeploymentSpec(spec)
-			}
-		case "StatefulSet", "DaemonSet":
-			if spec, ok := m["spec"].(map[string]interface{}); ok {
-				cleanDeploymentSpec(spec) // Similar cleanup as Deployment
-			}
-		case "Service":
-			if spec, ok := m["spec"].(map[string]interface{}); ok {
-				delete(spec, "clusterIP")
-				delete(spec, "clusterIPs")
-			}
-		case "ConfigMap":
-			if data, ok := m["data"].(map[string]interface{}); ok {
-				cleanConfigMapData(data)
-			}
-		}
-	}
-
-	// Remove all runtime fields
-	removeRuntimeFields(m)
-
-	// Recursively process nested maps and arrays
-	for _, value := range m {
+	// Recursively clean the rest of the container spec
+	for _, value := range container {
 		switch v := value.(type) {
 		case map[string]interface{}:
-			cleanupMap(v)
+			cleanContainerSpec(v, options)
 		case []interface{}:
 			for _, item := range v {
 				if itemMap, ok := item.(map[string]interface{}); ok {
-					cleanupMap(itemMap)
+					cleanContainerSpec(itemMap, options)
 				}
 			}
 		}
 	}
-
-	// Remove empty maps
-	for key, value := range m {
-		if mapVal, ok := value.(map[string]interface{}); ok && len(mapVal) == 0 {
-			delete(m, key)
-		}
-	}
 }
 
-// removeRuntimeFields removes all runtime-specific fields
-func removeRuntimeFields(m map[string]interface{}) {
-	for _, path := range runtimeFieldsToRemove {
-		parts := strings.Split(path, ".")
-		current := m
-		for _, part := range parts[:len(parts)-1] {
-			if next, ok := current[part].(map[string]interface{}); ok {
-				current = next
-			} else {
-				break
+// cleanPodVolumes removes kube-api-access volumes and related volumeMounts
+func cleanPodVolumes(spec map[string]interface{}) {
+	if volumes, ok := spec["volumes"].([]interface{}); ok {
+		cleanedVolumes := make([]interface{}, 0)
+		for _, volume := range volumes {
+			if volumeMap, ok := volume.(map[string]interface{}); ok {
+				if name, exists := volumeMap["name"].(string); exists && !strings.HasPrefix(name, "kube-api-access") {
+					cleanedVolumes = append(cleanedVolumes, volume)
+				}
 			}
 		}
-		if len(parts) > 0 {
-			delete(current, parts[len(parts)-1])
+		spec["volumes"] = cleanedVolumes
+	}
+
+	// Clean volumeMounts in containers
+	if containers, ok := spec["containers"].([]interface{}); ok {
+		for _, container := range containers {
+			if containerMap, ok := container.(map[string]interface{}); ok {
+				if volumeMounts, exists := containerMap["volumeMounts"].([]interface{}); exists {
+					cleanedVolumeMounts := make([]interface{}, 0)
+					for _, vm := range volumeMounts {
+						if vmMap, ok := vm.(map[string]interface{}); ok {
+							if name, exists := vmMap["name"].(string); exists && !strings.HasPrefix(name, "kube-api-access") {
+								cleanedVolumeMounts = append(cleanedVolumeMounts, vm)
+							}
+						}
+					}
+					containerMap["volumeMounts"] = cleanedVolumeMounts
+				}
+			}
 		}
 	}
 }
 
-// cleanKubernetesObject ensures the object is stripped of cluster-specific data
-func cleanKubernetesObject(objMap map[string]interface{}) {
-	// Remove namespace-specific fields
-	if metadata, ok := objMap["metadata"].(map[string]interface{}); ok {
-		delete(metadata, "namespace")
+// revertPodToDeployment attempts to reconstruct a Deployment from a Pod.
+func revertPodToDeployment(obj *KubernetesObject) {
+	if obj.Kind != "Pod" {
+		return // Only process Pods
 	}
 
-	// Remove controller-specific fields
-	if spec, ok := objMap["spec"].(map[string]interface{}); ok {
-		delete(spec, "replicas")
+	// Check for the presence of a pod-template-hash.  This is a strong indicator
+	// that the Pod was created by a Deployment.
+	if labels, ok := obj.Metadata["labels"].(map[string]interface{}); ok {
+		if _, hasHash := labels["pod-template-hash"]; hasHash {
+			// Create a basic Deployment structure.
+			deployment := map[string]interface{}{
+				"apiVersion": "apps/v1", //  Hardcoded,
+				"kind":       "Deployment",
+				"metadata": map[string]interface{}{
+					"name":      obj.Metadata["name"],      // Try to keep original name
+					"labels":    obj.Metadata["labels"],    // Copy labels
+					"namespace": obj.Metadata["namespace"], //copy namespace
+				},
+				"spec": map[string]interface{}{
+					"selector": map[string]interface{}{
+						"matchLabels": map[string]interface{}{
+							"pod-template-hash": labels["pod-template-hash"],
+						},
+					},
+					"template": map[string]interface{}{
+						"metadata": map[string]interface{}{
+							"labels": labels, //copy labels
+						},
+						"spec": obj.Spec, // Move the Pod's spec to the template
+					},
+				},
+			}
+			obj.Kind = "Deployment"
+			obj.Spec = deployment["spec"].(map[string]interface{})
+			obj.APIVersion = deployment["apiVersion"].(string)
+			obj.Metadata = deployment["metadata"].(map[string]interface{})
+			//clean the obj.metadata
+			delete(obj.Metadata, "generateName")
+
+			log.Println("Reverted Pod to Deployment")
+		}
 	}
-
-	// Validate and clean fields using Kubernetes schema
-	apiVersion, _ := objMap["apiVersion"].(string)
-	kind, _ := objMap["kind"].(string)
-	gvk := schema.FromAPIVersionAndKind(apiVersion, kind)
-
-	// Create a placeholder object for schema validation
-	obj, err := scheme.Scheme.New(gvk)
-	if err != nil {
-		// If the object type is unknown, skip schema-based cleanup
-		fmt.Fprintf(os.Stderr, "Warning: Unknown GVK %s, skipping schema-based cleanup\n", gvk)
-		return
-	}
-
-	// Perform schema-based cleanup (if applicable)
-	// Placeholder logic: Add schema-based cleanup here if needed
-	_ = obj
 }
 
-func cleanupManifest(input io.Reader, output io.Writer) error {
+// ObjectCleanerFactory maps kinds to cleaners.
+type ObjectCleanerFactory struct {
+	cleaners map[string]ObjectCleaner
+}
+
+// GetCleaner returns the appropriate cleaner for the given kind.
+func (f *ObjectCleanerFactory) GetCleaner(kind string) ObjectCleaner {
+	cleaner, ok := f.cleaners[kind]
+	if !ok {
+		// Default to the generic cleaner.
+		return f.cleaners["Generic"]
+	}
+	return cleaner
+}
+
+// NewObjectCleanerFactory creates a new ObjectCleanerFactory.
+func NewObjectCleanerFactory() *ObjectCleanerFactory {
+	genericCleaner := &GenericObjectCleaner{metadataCleaner: &GenericMetadataCleaner{}}
+	return &ObjectCleanerFactory{
+		cleaners: map[string]ObjectCleaner{
+			"Generic":     genericCleaner,
+			"Deployment":  &DeploymentCleaner{genericCleaner: genericCleaner},
+			"Service":     &ServiceCleaner{genericCleaner: genericCleaner},
+			"StatefulSet": &StatefulSetCleaner{genericCleaner: genericCleaner},
+			"DaemonSet":   &DaemonSetCleaner{genericCleaner: genericCleaner},
+			"Pod":         &PodCleaner{genericCleaner: genericCleaner},
+			"ConfigMap":   &ConfigMapCleaner{genericCleaner: genericCleaner},
+			"Secret":      &SecretCleaner{genericCleaner: genericCleaner},
+			// Add more cleaners for other kinds as needed.
+		},
+	}
+}
+
+// cleanupKubernetesObject cleans a Kubernetes object based on its kind.
+func cleanupKubernetesObject(obj *KubernetesObject, options *CleanupOptions, cleanerFactory *ObjectCleanerFactory) {
+	cleaner := cleanerFactory.GetCleaner(obj.Kind)
+	cleanupErr := false
+	if cleaner == nil {
+		log.Printf("ERROR: Cleaner for %s is nil", obj.Kind)
+		cleanupErr = true
+	} else {
+		cleaner.Clean(obj, options)
+	}
+
+	if cleanupErr {
+		log.Printf("ERROR: Object was not cleaned %v", obj)
+	}
+
+}
+
+// cleanupManifest processes the input YAML, cleans each object, and writes the cleaned YAML to the output.
+func cleanupManifest(input io.Reader, output io.Writer, options *CleanupOptions) error {
 	reader := bufio.NewReader(input)
 	decoder := yaml.NewDecoder(reader)
 	encoder := yaml.NewEncoder(output)
 	defer encoder.Close()
 
 	documentCount := 0
+	cleanerFactory := NewObjectCleanerFactory()
+
 	for {
 		var obj KubernetesObject
 		err := decoder.Decode(&obj)
 		if err == io.EOF {
 			if documentCount == 0 {
-				return &EmptyDocumentError{}
+				return fmt.Errorf("no valid YAML documents found")
 			}
 			break
 		}
@@ -455,43 +569,38 @@ func cleanupManifest(input io.Reader, output io.Writer) error {
 		}
 		documentCount++
 
-		// Skip empty documents
 		if obj.Kind == "" && obj.APIVersion == "" {
-			continue
+			log.Println("Skipping empty document")
+			continue // Skip empty documents
 		}
 
-		// Convert the object to a map for recursive cleanup
-		objMap := make(map[string]interface{})
-		data, err := yaml.Marshal(obj)
-		if err != nil {
-			return fmt.Errorf("error marshaling object: %w", err)
-		}
-		if err := yaml.Unmarshal(data, &objMap); err != nil {
-			return fmt.Errorf("error unmarshaling to map: %w", err)
-		}
+		cleanupKubernetesObject(&obj, options, cleanerFactory)
 
-		// Perform recursive cleanup
-		cleanupMap(objMap)
-
-		// Perform additional cleanup using Kubernetes-specific logic
-		cleanKubernetesObject(objMap)
-
-		// Encode the cleaned object
-		err = encoder.Encode(objMap)
+		err = encoder.Encode(obj)
 		if err != nil {
 			return fmt.Errorf("error encoding cleaned YAML: %w", err)
 		}
 	}
-
 	return nil
 }
 
 func main() {
-	if err := cleanupManifest(os.Stdin, os.Stdout); err != nil {
-		if _, ok := err.(*EmptyDocumentError); ok {
-			fmt.Fprintln(os.Stderr, "Warning: No valid YAML documents found")
-			return
-		}
+	options := &CleanupOptions{
+		RemoveManagedFields: true,
+		RemoveStatus:        true,
+		RemoveNamespace:     true,
+		RemoveClusterName:   true,
+		RemoveLabels:        []string{},
+		RemoveAnnotations:   []string{},
+		RemoveEmpty:         true,
+		CleanupFinalizers:   false,
+		RevertToDeployment:  true, // Enable reverting to Deployment
+	}
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("[Kleanup] ")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
+	if err := cleanupManifest(os.Stdin, os.Stdout, options); err != nil {
 		fmt.Fprintf(os.Stderr, "Error cleaning manifest: %v\n", err)
 		os.Exit(1)
 	}
