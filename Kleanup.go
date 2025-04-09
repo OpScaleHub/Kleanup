@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+
 // KubernetesObject represents the basic structure of Kubernetes objects.
 type KubernetesObject struct {
 	APIVersion string                 `yaml:"apiVersion"`
