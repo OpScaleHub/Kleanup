@@ -25,15 +25,40 @@ type KubernetesObject struct {
 
 // CleanupOptions defines options to customize the cleanup process.
 type CleanupOptions struct {
-	RemoveManagedFields bool
-	RemoveStatus        bool
-	RemoveNamespace     bool
-	RemoveClusterName   bool     // Remove cluster name
-	RemoveLabels        []string // labels to remove
-	RemoveAnnotations   []string // annotations to remove
-	RemoveEmpty         bool     // Remove empty fields
-	CleanupFinalizers   bool     // Remove finalizers
-	RevertToDeployment  bool     // Attempt to reconstruct Deployment
+	RemoveManagedFields   bool
+	RemoveStatus          bool
+	RemoveNamespace       bool
+	RemoveClusterName     bool     // Remove cluster name
+	RemoveLabels          []string // labels to remove
+	RemoveAnnotations     []string // annotations to remove
+	RemoveEmpty           bool     // Remove empty fields
+	CleanupFinalizers     bool     // Remove finalizers
+	RevertToDeployment    bool     // Attempt to reconstruct Deployment
+	PreserveResourceState bool     // Keep resource state related fields
+	ResourceStateMode     string   // "Desired" or "Runtime" cleanup mode
+}
+
+// ResourceState tracks which fields represent desired vs runtime state
+var resourceStateFields = map[string]map[string]bool{
+	"Deployment": {
+		"spec.replicas":       true,  // desired state
+		"spec.strategy":       true,  // desired state
+		"spec.template":       true,  // desired state
+		"status":              false, // runtime state
+		"metadata.generation": false, // runtime state
+	},
+	"Service": {
+		"spec.ports":     true,  // desired state
+		"spec.selector":  true,  // desired state
+		"spec.clusterIP": false, // runtime state
+	},
+	"Pod": {
+		"spec.containers":   true,  // desired state
+		"spec.volumes":      true,  // desired state
+		"spec.nodeSelector": true,  // desired state
+		"status":            false, // runtime state
+		"spec.nodeName":     false, // runtime state
+	},
 }
 
 // MetadataCleaner defines an interface for cleaning object metadata.
@@ -111,7 +136,7 @@ func cleanLabels(labels map[string]interface{}, removeLabels []string) {
 func cleanAnnotations(annotations map[string]interface{}, removeAnnotations []string) {
 	annotationPrefixesToRemove := []string{
 		"kubectl.kubernetes.io/",
-		"deployment.kubernetes.io/",
+		"deployment.kubernetes.io/", // This is already here but ensuring it's effective
 		"apps.kubernetes.io/",
 		"pod-template-hash",
 		"statefulset.kubernetes.io/",
@@ -157,6 +182,20 @@ func (c *GenericObjectCleaner) Clean(obj *KubernetesObject, options *CleanupOpti
 	if obj.Metadata != nil {
 		c.metadataCleaner.Clean(obj.Metadata, options)
 	}
+
+	// Handle state based cleaning
+	if options.PreserveResourceState {
+		if stateFields, ok := resourceStateFields[obj.Kind]; ok {
+			for field, isDesired := range stateFields {
+				if options.ResourceStateMode == "Desired" && !isDesired {
+					removeField(obj, field)
+				} else if options.ResourceStateMode == "Runtime" && isDesired {
+					removeField(obj, field)
+				}
+			}
+		}
+	}
+
 	if options.RemoveStatus {
 		obj.Status = nil
 	}
@@ -166,6 +205,33 @@ func (c *GenericObjectCleaner) Clean(obj *KubernetesObject, options *CleanupOpti
 	if options.RemoveEmpty {
 		removeEmptyFields(obj)
 	}
+}
+
+// Helper to remove nested fields using dot notation
+func removeField(obj *KubernetesObject, field string) {
+	parts := strings.Split(field, ".")
+	current := make(map[string]interface{})
+
+	switch parts[0] {
+	case "spec":
+		current = obj.Spec
+	case "status":
+		current = obj.Status
+	case "metadata":
+		current = obj.Metadata
+	default:
+		return
+	}
+
+	for i := 1; i < len(parts)-1; i++ {
+		if next, ok := current[parts[i]].(map[string]interface{}); ok {
+			current = next
+		} else {
+			return
+		}
+	}
+
+	delete(current, parts[len(parts)-1])
 }
 
 func removeEmptyFields(obj *KubernetesObject) {
@@ -208,6 +274,18 @@ func (c *DeploymentCleaner) Clean(obj *KubernetesObject, options *CleanupOptions
 		if template, ok := obj.Spec["template"].(map[string]interface{}); ok {
 			if spec, ok := template["spec"].(map[string]interface{}); ok {
 				cleanPodSpec(spec, options)
+				if templateMeta, ok := template["metadata"].(map[string]interface{}); ok {
+					// Remove null/empty fields from template metadata
+					for k, v := range templateMeta {
+						if v == nil {
+							delete(templateMeta, k)
+						}
+					}
+					// Remove template metadata if empty
+					if len(templateMeta) == 0 {
+						delete(template, "metadata")
+					}
+				}
 			}
 		}
 	}
@@ -349,11 +427,34 @@ func cleanPodSpec(spec map[string]interface{}, options *CleanupOptions) {
 
 	//clean template metadata
 	if template, ok := spec["template"].(map[string]interface{}); ok {
+		// Clean template metadata thoroughly
 		if templateMeta, ok := template["metadata"].(map[string]interface{}); ok {
-			delete(templateMeta, "creationTimestamp")
-			// Clean annotations *within* template.metadata
-			if annotations, ok := templateMeta["annotations"].(map[string]interface{}); ok {
-				cleanAnnotations(annotations, options.RemoveAnnotations)
+			// Remove all runtime metadata from template
+			fieldsToRemove := []string{
+				"creationTimestamp",
+				"generation",
+				"resourceVersion",
+				"selfLink",
+				"uid",
+			}
+			for _, field := range fieldsToRemove {
+				delete(templateMeta, field)
+			}
+
+			// If template metadata is empty except for labels, keep only labels
+			hasOnlyLabels := true
+			for k := range templateMeta {
+				if k != "labels" {
+					hasOnlyLabels = false
+					break
+				}
+			}
+
+			if len(templateMeta) == 0 || (hasOnlyLabels && templateMeta["labels"] != nil) {
+				// Keep template metadata if it has labels, otherwise remove it
+				if templateMeta["labels"] == nil {
+					delete(template, "metadata")
+				}
 			}
 		}
 	}
@@ -586,15 +687,17 @@ func cleanupManifest(input io.Reader, output io.Writer, options *CleanupOptions)
 
 func main() {
 	options := &CleanupOptions{
-		RemoveManagedFields: true,
-		RemoveStatus:        true,
-		RemoveNamespace:     true,
-		RemoveClusterName:   true,
-		RemoveLabels:        []string{},
-		RemoveAnnotations:   []string{},
-		RemoveEmpty:         true,
-		CleanupFinalizers:   false,
-		RevertToDeployment:  true, // Enable reverting to Deployment
+		RemoveManagedFields:   true,
+		RemoveStatus:          true,
+		RemoveNamespace:       true,
+		RemoveClusterName:     true,
+		RemoveLabels:          []string{},
+		RemoveAnnotations:     []string{},
+		RemoveEmpty:           true,
+		CleanupFinalizers:     false,
+		RevertToDeployment:    true, // Enable reverting to Deployment
+		PreserveResourceState: true,
+		ResourceStateMode:     "Desired", // Default to desired state cleanup
 	}
 	log.SetOutput(os.Stderr)
 	log.SetPrefix("[Kleanup] ")
