@@ -13,6 +13,7 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+  workflow_dispatch: # Allow manual triggering of the workflow
 
 jobs:
   build-test:
