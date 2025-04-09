@@ -60,6 +60,7 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: versioning
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' # Restrict to push on main branch
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
