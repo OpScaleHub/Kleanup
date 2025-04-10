@@ -74,12 +74,22 @@ jobs:
 
       - name: Ensure Git Tag
         run: |
+          # Check if the current commit doesn't already have a tag
           if [ -z "$(git tag --points-at HEAD)" ]; then
+            echo "No tag found at HEAD. Creating a new tag."
             git config user.name "GitHub Actions"
             git config user.email "actions@github.com"
-            git tag -a v$(date +'%Y.%m.%d.%H%M%S') -m "Automated tag"o avoid requiring a tag
-            git push origin --tags
+            # Corrected git tag command: removed extra text after the message quotes
+            TAG_NAME="v$(date +'%Y.%m.%d.%H%M%S')"
+            echo "Creating tag: $TAG_NAME"
+            git tag -a "$TAG_NAME" -m "Automated timestamp tag"
+            echo "Pushing tag $TAG_NAME to origin."
+            git push origin "$TAG_NAME"
+          else
+            echo "Tag already exists at HEAD. Skipping tag creation."
           fi
+        # Note: GoReleaser will typically use the latest tag found unless configured otherwise.
+        # This step ensures *a* tag exists if none points to the current commit.
 
       - name: Create GitHub Release
         id: release
