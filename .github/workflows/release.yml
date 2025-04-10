@@ -8,6 +8,7 @@ on:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+      - 'rebuild.trigger'
   pull_request:
     paths:
       - '**/*.go'
