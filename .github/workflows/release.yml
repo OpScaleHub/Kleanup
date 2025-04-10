@@ -2,28 +2,29 @@
 name: Release Workflow
 
 on:
-  # Trigger build/test on pushes to main and pull requests
+  # Trigger build/test on pushes to main and pull requests,
+  # AND trigger the FULL release process ONLY when a SemVer tag is pushed
   push:
     branches:
       - main
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'    # Matches vX.Y.Z
+      - 'v[0-9]+.[0-9]+.[0-9]+-*' # Matches vX.Y.Z-prerelease.tag
+    # Apply path filters to both branch pushes and tag pushes
+    # (The build-test job runs on both, the release job filters by tag presence)
     paths:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
+
+  # Trigger build/test on pull requests
   pull_request:
     paths:
       - '**/*.go'
       - 'go.mod'
       - 'go.sum'
 
-  # Trigger the FULL release process ONLY when a SemVer tag is pushed
-  # Examples: v1.0.0, v1.2.3, v0.1.0-beta.1
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'    # Matches vX.Y.Z
-      - 'v[0-9]+.[0-9]+.[0-9]+-*' # Matches vX.Y.Z-prerelease.tag
-
-  # Allow manual triggering (useful for testing the release process or forcing a release)
+  # Allow manual triggering
   workflow_dispatch:
 
 jobs:
